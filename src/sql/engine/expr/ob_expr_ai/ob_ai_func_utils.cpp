@@ -18,6 +18,8 @@
 #include "ob_ai_func_utils.h"
 #include "ob_ai_func_client.h"
 #include "query/engine/expr/ob_ai_model_resolver.h"
+#include <cmath>
+#include <cstdlib>
 
 namespace oceanbase 
 {
@@ -1432,13 +1434,32 @@ int ObAIFuncModel::call_dense_embedding_vector(ObArray<ObString> &contents, ObJs
 }
 
 
-// Validate the shape of one embedding array returned by the AI service.
-// A dense embedding result is consumed as float[dimension] by the upper layer,
-// so the response must be a JSON array of numbers whose element count equals the
-// requested dimension. A provider that answers with an object, an empty array,
-// or an array of a different size must be rejected here with a user visible
-// error, otherwise the failure surfaces much later as a wrong vector or a crash.
+// A dense embedding is consumed as float[dimension] by the upper layer, so the
+// provider response has to be a JSON array of finite numbers whose length is the
+// vector dimension. Anything else (an object, an empty array, a string element,
+// NaN/Inf) must be rejected here with a user visible error; forwarding it would
+// surface much later as a wrong vector, a failed cast or a crash.
+static bool is_valid_embedding_number(const ObString &str)
+{
+  bool valid = false;
+  const int64_t len = str.length();
+  char buf[64];
+  if (OB_ISNULL(str.ptr()) || len <= 0 || len >= static_cast<int64_t>(sizeof(buf))) {
+    valid = false;
+  } else {
+    MEMCPY(buf, str.ptr(), len);
+    buf[len] = '\0';
+    char *end = nullptr;
+    const double value = strtod(buf, &end);
+    // a leading quote/true/false/null is rejected because strtod stops at once,
+    // and a partially consumed buffer means the element is not a bare number.
+    valid = (end == buf + len) && std::isfinite(value);
+  }
+  return valid;
+}
+
 static int check_embedding_array_shape(const ObIJsonBase *node,
+                                       ObIAllocator &allocator,
                                        const int64_t expect_dim,
                                        int64_t &actual_dim)
 {
@@ -1451,7 +1472,8 @@ static int check_embedding_array_shape(const ObIJsonBase *node,
     ret = OB_INVALID_ARGUMENT;
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_embed, embedding result is not an array");
   } else {
-    const int64_t count = static_cast<const ObJsonArray *>(node)->element_count();
+    const ObJsonArray *array = static_cast<const ObJsonArray *>(node);
+    const int64_t count = array->element_count();
     if (count <= 0) {
       ret = OB_INVALID_ARGUMENT;
       LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_embed, embedding result is an empty array");
@@ -1463,7 +1485,22 @@ static int check_embedding_array_shape(const ObIJsonBase *node,
       ret = OB_INVALID_ARGUMENT;
       FORWARD_USER_ERROR(ret, err_msg);
     } else {
-      actual_dim = count;
+      for (int64_t i = 0; OB_SUCC(ret) && i < count; i++) {
+        ObString elem_str;
+        ObIJsonBase *elem = array->get_value(i);
+        if (OB_ISNULL(elem)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("embedding element is null", K(ret), K(i));
+        } else if (OB_FAIL(ObAIFuncJsonUtils::print_json_to_str(allocator, elem, elem_str))) {
+          LOG_WARN("failed to print embedding element", K(ret), K(i));
+        } else if (!is_valid_embedding_number(elem_str)) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_embed, embedding element is not a finite number");
+        }
+      }
+      if (OB_SUCC(ret)) {
+        actual_dim = count;
+      }
     }
   }
   return ret;
@@ -1515,7 +1552,7 @@ int ObAIFuncModel::call_dense_embedding_vector_v2(ObArray<ObString> &content, Ob
         ObIJsonBase *j_base = result_array->get_value(i);
         if (OB_ISNULL(j_base)) {
           ret = OB_ERR_UNEXPECTED;
-        } else if (OB_FAIL(check_embedding_array_shape(j_base, dimension, actual_dim))) {
+        } else if (OB_FAIL(check_embedding_array_shape(j_base, *allocator_, dimension, actual_dim))) {
         } else if (0 == batch_dim) {
           batch_dim = actual_dim;
         } else if (batch_dim != actual_dim) {
