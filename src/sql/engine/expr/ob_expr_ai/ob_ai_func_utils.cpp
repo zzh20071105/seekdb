@@ -1432,6 +1432,43 @@ int ObAIFuncModel::call_dense_embedding_vector(ObArray<ObString> &contents, ObJs
 }
 
 
+// Validate the shape of one embedding array returned by the AI service.
+// A dense embedding result is consumed as float[dimension] by the upper layer,
+// so the response must be a JSON array of numbers whose element count equals the
+// requested dimension. A provider that answers with an object, an empty array,
+// or an array of a different size must be rejected here with a user visible
+// error, otherwise the failure surfaces much later as a wrong vector or a crash.
+static int check_embedding_array_shape(const ObIJsonBase *node,
+                                       const int64_t expect_dim,
+                                       int64_t &actual_dim)
+{
+  int ret = OB_SUCCESS;
+  actual_dim = 0;
+  if (OB_ISNULL(node)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("embedding result node is null", K(ret));
+  } else if (node->json_type() != ObJsonNodeType::J_ARRAY) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_embed, embedding result is not an array");
+  } else {
+    const int64_t count = static_cast<const ObJsonArray *>(node)->element_count();
+    if (count <= 0) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_embed, embedding result is an empty array");
+    } else if (expect_dim > 0 && count != expect_dim) {
+      char err_msg[256];
+      snprintf(err_msg, sizeof(err_msg),
+               "ai_embed, result dimension %ld does not match the requested dimension %ld",
+               count, expect_dim);
+      ret = OB_INVALID_ARGUMENT;
+      FORWARD_USER_ERROR(ret, err_msg);
+    } else {
+      actual_dim = count;
+    }
+  }
+  return ret;
+}
+
 int ObAIFuncModel::call_dense_embedding_vector_v2(ObArray<ObString> &content, ObJsonObject *config, ObArray<ObString> &results)
 {
   int ret = OB_SUCCESS;
@@ -1470,14 +1507,20 @@ int ObAIFuncModel::call_dense_embedding_vector_v2(ObArray<ObString> &content, Ob
     int64_t count = result_array->element_count();
     if (content.count() != count) {
       ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("ai_embed, embedding result count does not match the input count", K(ret), K(content.count()), K(count));
     } else {
+      int64_t batch_dim = 0;
       for (int64_t i = 0; OB_SUCC(ret) && i < count; i++) {
+        int64_t actual_dim = 0;
         ObIJsonBase *j_base = result_array->get_value(i);
         if (OB_ISNULL(j_base)) {
           ret = OB_ERR_UNEXPECTED;
-        } else if (dimension > 0 && static_cast<ObJsonArray *>(j_base)->element_count() != dimension) {
+        } else if (OB_FAIL(check_embedding_array_shape(j_base, dimension, actual_dim))) {
+        } else if (0 == batch_dim) {
+          batch_dim = actual_dim;
+        } else if (batch_dim != actual_dim) {
           ret = OB_INVALID_ARGUMENT;
-          LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_embed, result dimension is not equal to dimension");
+          LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_embed, dimensions of embeddings in one batch are not consistent");
         } else if (OB_FAIL(ObAIFuncJsonUtils::print_json_to_str(*allocator_, j_base, result_str))) {
         } else {
           results.push_back(result_str);
