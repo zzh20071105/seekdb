@@ -53,6 +53,33 @@ class ObCsvFileScanner;
 class ObFileColumnSchema;
 class ObCsvFileReader;
 
+// Splits one logical CSV record into fields, honouring RFC 4180 quoting: a
+// quoted field may contain the delimiter, doubled quotes and CR/LF. The record
+// must already be stripped of its trailing line delimiter. The returned
+// ObStrings point into the tokenizer's own buffer and stay valid until the next
+// split_record() call.
+class ObCsvTokenizer
+{
+public:
+  explicit ObCsvTokenizer(common::ObIAllocator &alloc);
+  ~ObCsvTokenizer();
+  int split_record(const common::ObString &record, common::ObIArray<common::ObString> &fields);
+private:
+  int ensure_capacity(const int64_t need);
+  common::ObIAllocator &alloc_;
+  char *buf_;
+  int64_t capacity_;
+};
+
+// Narrowest deterministic type that can hold "value". An empty field, "NULL" and
+// the default MySQL NULL literal are all FILE_COL_NULL.
+int classify_scalar(const common::ObString &value, ObFileColumnType &type);
+
+// Deterministic widening of two inferred column types:
+//   NULL      + x        -> x
+//   BIGINT    + DOUBLE   -> DOUBLE
+//   DATE      + DATETIME -> DATETIME
+//   anything else mixed, or anything + VARCHAR -> VARCHAR
 int get_wider_type(const ObFileColumnType lhs, const ObFileColumnType rhs, ObFileColumnType &result);
 
 } // namespace file_sql
